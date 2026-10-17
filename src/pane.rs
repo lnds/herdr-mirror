@@ -448,6 +448,23 @@ impl RawMode {
     }
 }
 
+/// Drop whatever is already queued on the pane's tty before we start reading it.
+///
+/// The daemon launches us by typing `exec herdr-mirror pane ...` into a fresh
+/// shell, and retypes that line when our pidfile hasn't shown up after a few
+/// seconds (`spawn_streamer_pane`). A shell that is merely slow — not one that
+/// ate the first line — ends up with both lines queued: it execs the first, and
+/// the second is left in the tty input queue for us. Read as a keystroke, that
+/// line escalates Observe to Control (resizing the remote pty) and is delivered
+/// to the remote pane as typed text. Anything else in the queue was typed at the
+/// shell we replaced, not at the remote pane. The pidfile is written before this
+/// runs, so any retype checked after the flush sees us alive and is skipped.
+fn discard_typeahead() {
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
 fn write_stdout(s: &str) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -1583,6 +1600,7 @@ pub async fn run(args: Args) -> Result<()> {
         // notch into us, which we'd forward, and a shell would walk command
         // history instead of scrolling (#69).
         write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
+        discard_typeahead();
         RawMode::enable()
     } else {
         None
