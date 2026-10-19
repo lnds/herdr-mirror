@@ -457,11 +457,72 @@ impl RawMode {
 /// the second is left in the tty input queue for us. Read as a keystroke, that
 /// line escalates Observe to Control (resizing the remote pty) and is delivered
 /// to the remote pane as typed text. Anything else in the queue was typed at the
-/// shell we replaced, not at the remote pane. The pidfile is written before this
-/// runs, so any retype checked after the flush sees us alive and is skipped.
+/// shell we replaced, not at the remote pane.
+///
+/// This only covers a retype that is already queued. One the daemon decided on
+/// just before our pidfile appeared can still land after the flush; see
+/// `LaunchEcho` for that half.
 fn discard_typeahead() {
     unsafe {
         libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+/// How long after startup a retyped launch line can still reach us. The daemon
+/// retypes at 3s and 7s after the first attempt; past this, nothing filters.
+const LAUNCH_ECHO_WINDOW: Duration = Duration::from_secs(30);
+
+/// Strips our own launch line from stdin during the first seconds of life.
+///
+/// The daemon checks our pidfile, and if it isn't there yet, types the exec
+/// line again. Check and delivery are not atomic: a check that runs just
+/// before we write the pidfile delivers its line after `discard_typeahead`
+/// has already run, straight into our stdin. That line is reconstructible
+/// byte for byte from our own argv — the daemon builds it from the same argv
+/// with the same quoting — and it carries the absolute binary path and the
+/// remote pane id, so nobody types it by hand into a remote pane.
+struct LaunchEcho {
+    line: Vec<u8>,
+    until: Instant,
+}
+
+impl LaunchEcho {
+    fn new(argv: &[String], now: Instant) -> Self {
+        let line = format!(
+            "exec {}",
+            argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
+        );
+        LaunchEcho { line: line.into_bytes(), until: now + LAUNCH_ECHO_WINDOW }
+    }
+
+    /// Remove every complete occurrence of the launch line, with the line
+    /// terminator that follows it, from `chunk`.
+    fn strip(&self, chunk: &[u8], now: Instant) -> Vec<u8> {
+        if now >= self.until || self.line.is_empty() || chunk.len() < self.line.len() {
+            return chunk.to_vec();
+        }
+        let mut out = Vec::with_capacity(chunk.len());
+        let mut i = 0;
+        while i < chunk.len() {
+            if chunk[i..].starts_with(&self.line) {
+                i += self.line.len();
+                if i < chunk.len() && (chunk[i] == b'\n' || chunk[i] == b'\r') {
+                    i += 1;
+                }
+            } else {
+                out.push(chunk[i]);
+                i += 1;
+            }
+        }
+        // herdr frames typed text as a paste when we have DECSET 2004 on; the
+        // framing around a stripped line is all that's left of it.
+        const EMPTY_PASTE: &[u8] = b"\x1b[200~\x1b[201~";
+        if out.len() < chunk.len() {
+            while let Some(at) = out.windows(EMPTY_PASTE.len()).position(|w| w == EMPTY_PASTE) {
+                out.drain(at..at + EMPTY_PASTE.len());
+            }
+        }
+        out
     }
 }
 
@@ -1611,6 +1672,9 @@ pub async fn run(args: Args) -> Result<()> {
     // stdin reader
     {
         let tx = tx.clone();
+        let echo = tty.then(|| {
+            LaunchEcho::new(&std::env::args().collect::<Vec<_>>(), Instant::now())
+        });
         tokio::spawn(async move {
             let mut stdin = tokio::io::stdin();
             let mut buf = [0u8; 1024];
@@ -1618,7 +1682,14 @@ pub async fn run(args: Args) -> Result<()> {
                 match stdin.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if tx.send(Msg::Stdin(buf[..n].to_vec())).await.is_err() {
+                        let bytes = match &echo {
+                            Some(e) => e.strip(&buf[..n], Instant::now()),
+                            None => buf[..n].to_vec(),
+                        };
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if tx.send(Msg::Stdin(bytes)).await.is_err() {
                             break;
                         }
                     }
@@ -1820,6 +1891,67 @@ pub async fn run(args: Args) -> Result<()> {
         raw.restore();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod launch_echo_tests {
+    use super::*;
+
+    fn argv() -> Vec<String> {
+        ["/opt/it's/herdr-mirror", "pane", "host", "w1:p1", "--cols", "80"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    // The daemon's launcher (`mirror::spawn_streamer_pane`) types exactly this.
+    const TYPED: &[u8] =
+        b"exec '/opt/it'\\''s/herdr-mirror' 'pane' 'host' 'w1:p1' '--cols' '80'\n";
+
+    #[test]
+    fn strips_the_retyped_launch_line() {
+        let now = Instant::now();
+        let echo = LaunchEcho::new(&argv(), now);
+        assert!(echo.strip(TYPED, now).is_empty());
+    }
+
+    #[test]
+    fn keeps_input_around_the_launch_line() {
+        let now = Instant::now();
+        let echo = LaunchEcho::new(&argv(), now);
+        let mut chunk = b"a".to_vec();
+        chunk.extend_from_slice(TYPED);
+        chunk.extend_from_slice(b"b");
+        assert_eq!(echo.strip(&chunk, now), b"ab");
+    }
+
+    #[test]
+    fn strips_a_launch_line_framed_as_a_paste() {
+        let now = Instant::now();
+        let echo = LaunchEcho::new(&argv(), now);
+        let mut chunk = b"\x1b[200~".to_vec();
+        chunk.extend_from_slice(TYPED);
+        chunk.extend_from_slice(b"\x1b[201~");
+        assert!(echo.strip(&chunk, now).is_empty());
+        // an empty paste the user really sent is not ours to drop
+        assert_eq!(echo.strip(b"\x1b[200~\x1b[201~", now), b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn leaves_other_input_alone() {
+        let now = Instant::now();
+        let echo = LaunchEcho::new(&argv(), now);
+        assert_eq!(echo.strip(b"exec ls\n", now), b"exec ls\n");
+        assert_eq!(echo.strip(b"\x1b[A", now), b"\x1b[A");
+    }
+
+    #[test]
+    fn stops_filtering_after_the_window() {
+        let now = Instant::now();
+        let echo = LaunchEcho::new(&argv(), now);
+        let later = now + LAUNCH_ECHO_WINDOW;
+        assert_eq!(echo.strip(TYPED, later), TYPED);
+    }
 }
 
 #[cfg(test)]
